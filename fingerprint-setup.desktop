@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Fingerprint Setup
+Comment=Install the fingerprint driver, register fingers and turn on fingerprint login
+Exec=fingerprint-setup gui
+Icon=auth-fingerprint-symbolic
+Terminal=false
+Categories=Settings;HardwareSettings;Security;
+Keywords=fingerprint;biometric;login;fprintd;libfprint;sensor;

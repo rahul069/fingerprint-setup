@@ -1,0 +1,523 @@
+#!/usr/bin/env bash
+#
+# fingerprint-setup: make fingerprint readers work on Ubuntu/Debian when the
+# distribution's libfprint is too old to know them.
+#
+# It builds a current upstream libfprint release, installs it into /usr/local
+# (the distribution's packages stay untouched), and helps you register fingers
+# and turn on fingerprint login. `fingerprint-setup uninstall` undoes it.
+#
+# https://github.com/rahul069/fingerprint-setup · MIT License
+
+set -euo pipefail
+
+readonly VERSION="1.0.0"
+readonly PROJECT_URL="https://github.com/rahul069/fingerprint-setup"
+readonly LIBFPRINT_REPO="https://gitlab.freedesktop.org/libfprint/libfprint.git"
+# libfprint main after v1.94.100: the v1.94.100 tag itself fails to configure without
+# introspection on meson 1.3 (Ubuntu 24.04). A tag or a full commit hash works here.
+readonly DEFAULT_TAG="6f9479c3d55f847c1b3769f28ceb99227f9858cf"
+LIBFPRINT_TAG="${LIBFPRINT_TAG:-$DEFAULT_TAG}"
+
+readonly PREFIX=/usr/local
+readonly STATE_DIR=$PREFIX/share/fingerprint-setup
+readonly MANIFEST=$STATE_DIR/installed-files
+readonly LDCONF=/etc/ld.so.conf.d/00-fingerprint-setup.conf
+readonly PAM_PROFILE=/usr/share/pam-configs/fprintd
+WORK_DIR="${FINGERPRINT_SETUP_WORKDIR:-/var/cache/fingerprint-setup}"
+
+readonly BUILD_DEPS=(git meson ninja-build pkg-config gcc libglib2.0-dev libgusb-dev
+  libpixman-1-dev libnss3-dev libgudev-1.0-dev libcairo2-dev libssl-dev libudev-dev)
+readonly RUNTIME_DEPS=(fprintd libpam-fprintd)
+
+readonly FINGERS=(right-index-finger right-middle-finger right-thumb right-ring-finger
+  right-little-finger left-index-finger left-middle-finger left-thumb left-ring-finger
+  left-little-finger)
+
+# USB vendor IDs of fingerprint-sensor makers (FocalTech, Synaptics, Goodix, Validity,
+# Elan, FPC, Egis, Next Biometrics, Upek, AuthenTec, DigitalPersona, Chipsailing).
+readonly SENSOR_VENDORS="2808|06cb|27c6|138a|04f3|10a5|1c7a|298d|147e|08ff|05ba|2541"
+
+SELF=$(readlink -f "${BASH_SOURCE[0]}")
+readonly SELF
+GUI=0
+
+# ---------------------------------------------------------------- output helpers
+
+if [[ -t 1 ]]; then
+  B=$'\e[1m' G=$'\e[32m' Y=$'\e[33m' R=$'\e[31m' N=$'\e[0m'
+else
+  B="" G="" Y="" R="" N=""
+fi
+
+step() { printf '%s==>%s %s\n' "$B" "$N" "$*"; }
+ok()   { printf '%s✓%s %s\n' "$G" "$N" "$*"; }
+warn() { printf '%swarning:%s %s\n' "$Y" "$N" "$*" >&2; }
+die() {
+  printf '%serror:%s %s\n' "$R" "$N" "$*" >&2
+  if (( GUI )); then zenity --error --title="Fingerprint Setup" --text="$(markup_escape <<<"$*")" || true; fi
+  exit 1
+}
+
+markup_escape() { sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g'; }
+
+# Re-run the current command as root (sudo in a terminal).
+require_root() {
+  (( EUID == 0 )) && return 0
+  command -v sudo >/dev/null || die "this step needs root; run it as root"
+  exec sudo -- "$SELF" "$@"
+}
+
+require_user() {
+  (( EUID != 0 )) || die "run this as your normal user, not with sudo (fingerprints are stored per user)"
+}
+
+# The person at the desk, also when we run through sudo or pkexec.
+target_user() {
+  if [[ -n ${SUDO_USER:-} ]]; then echo "$SUDO_USER"
+  elif [[ -n ${PKEXEC_UID:-} ]]; then id -un "$PKEXEC_UID"
+  else id -un
+  fi
+}
+
+# Run a command, keep its output in the build log, show the tail if it fails.
+run_logged() {
+  if ! "$@" >>"$WORK_DIR/build.log" 2>&1; then
+    tail -n 25 "$WORK_DIR/build.log" >&2
+    die "'$*' failed. Full log: $WORK_DIR/build.log"
+  fi
+}
+
+# ---------------------------------------------------------------- system state
+
+# "vid:pid<TAB>name" for every USB device made by a fingerprint-sensor vendor.
+sensors() {
+  local d v p n
+  for d in /sys/bus/usb/devices/*; do
+    [[ -r $d/idVendor && -r $d/idProduct ]] || continue
+    v=$(<"$d/idVendor") p=$(<"$d/idProduct")
+    [[ $v =~ ^($SENSOR_VENDORS)$ ]] || continue
+    n=$(cat "$d/manufacturer" "$d/product" 2>/dev/null | paste -sd ' ' || true)
+    printf '%s:%s\t%s\n' "$v" "$p" "${n:-unknown device}"
+  done | sort -u
+}
+
+fprintd_info() { command -v fprintd-list >/dev/null && LC_ALL=C fprintd-list "$1" 2>&1 || true; }
+
+reader_name() {
+  sed -nE -e 's/^Fingerprints for user .* on (.*) \((press|swipe)\):$/\1/p' \
+          -e 's/^User .* has no fingers enrolled for (.*)\.$/\1/p' <<<"$1" | head -n 1
+}
+
+enrolled_fingers() { sed -nE 's/^ - #[0-9]+: (.*)$/\1/p' <<<"$1"; }
+
+login_enabled() { grep -qs pam_fprintd /etc/pam.d/common-auth; }
+
+installed_tag() { cat "$STATE_DIR/version" 2>/dev/null || true; }
+
+# Short form of a tag or commit for messages.
+ref_label() { if [[ $1 =~ ^[0-9a-f]{40}$ ]]; then echo "${1:0:10}"; else echo "$1"; fi; }
+
+# Path of the libfprint the system actually loads.
+loaded_lib() { ldconfig -p 2>/dev/null | awk '/libfprint-2\.so\.2 /{print $NF; exit}'; }
+
+driver_desc() {
+  local tag lib
+  tag=$(installed_tag) lib=$(loaded_lib)
+  if [[ -n $tag ]]; then echo "libfprint $(ref_label "$tag") (installed by fingerprint-setup)"
+  elif [[ $lib == "$PREFIX"/* ]]; then echo "custom libfprint in $PREFIX (not managed by fingerprint-setup)"
+  elif [[ -n $lib ]]; then echo "distribution libfprint $(dpkg-query -W -f='${Version}' libfprint-2-2 2>/dev/null || true)"
+  else echo "not installed"
+  fi
+}
+
+status_lines() {
+  local user info name fingers hw
+  user=$(target_user)
+  hw=$(sensors | awk -F'\t' '{printf "%s%s (%s)", (NR>1 ? ", " : ""), $2, $1}')
+  info=$(fprintd_info "$user")
+  name=$(reader_name "$info")
+  fingers=$(enrolled_fingers "$info" | paste -sd ',' | sed 's/,/, /g')
+  echo "Sensor: ${hw:-no known fingerprint sensor found}"
+  if ! command -v fprintd-list >/dev/null; then
+    echo "Reader: fprintd is not installed"
+  else
+    echo "Reader: ${name:-not working yet}"
+  fi
+  echo "Driver: $(driver_desc)"
+  echo "Registered fingers: ${fingers:-none}"
+  if login_enabled; then echo "Fingerprint login: on"; else echo "Fingerprint login: off"; fi
+}
+
+need_reader() {
+  [[ -n $(reader_name "$(fprintd_info "$(target_user)")") ]] ||
+    die "No working fingerprint reader yet. Run 'fingerprint-setup install' first."
+}
+
+valid_finger() {
+  local f
+  for f in "${FINGERS[@]}"; do [[ $f == "$1" ]] && return 0; done
+  return 1
+}
+
+# ---------------------------------------------------------------- install
+
+install_packages() {
+  local missing=() p
+  for p in "$@"; do
+    dpkg-query -W -f='${Status}' "$p" 2>/dev/null | grep -q 'install ok installed' || missing+=("$p")
+  done
+  (( ${#missing[@]} )) || return 0
+  step "Installing packages: ${missing[*]}"
+  DEBIAN_FRONTEND=noninteractive apt-get update -q
+  DEBIAN_FRONTEND=noninteractive apt-get install -y -q "${missing[@]}"
+}
+
+build_libfprint() {
+  local src=$WORK_DIR/libfprint-$LIBFPRINT_TAG
+  mkdir -p "$WORK_DIR"
+  : >"$WORK_DIR/build.log"
+  if [[ ! -f $src/meson.build ]]; then
+    step "Downloading libfprint $(ref_label "$LIBFPRINT_TAG")"
+    rm -rf "$src"
+    run_logged git init -q "$src"
+    run_logged git -C "$src" fetch -q --depth 1 "$LIBFPRINT_REPO" "$LIBFPRINT_TAG"
+    run_logged git -C "$src" -c advice.detachedHead=false checkout -q FETCH_HEAD
+  fi
+  step "Building libfprint $(ref_label "$LIBFPRINT_TAG") (takes a minute or two)"
+  rm -rf "$src/_build"
+  run_logged meson setup "$src/_build" "$src" --prefix="$PREFIX" --libdir=lib --buildtype=release \
+    -Dintrospection=false -Ddoc=false -Dgtk-examples=false -Dinstalled-tests=false \
+    -Dudev_rules=disabled -Dudev_hwdb=disabled
+  run_logged ninja -C "$src/_build"
+}
+
+# Succeeds if the freshly built libfprint knows at least one sensor in this machine.
+build_supports_sensor() {
+  local list id
+  list=$("$WORK_DIR/libfprint-$LIBFPRINT_TAG/_build/libfprint/fprint-list-supported-devices")
+  while IFS=$'\t' read -r id _; do
+    [[ -n $id ]] && grep -qi "^$id " <<<"$list" && return 0
+  done < <(sensors)
+  return 1
+}
+
+remove_installed_files() {
+  local f
+  [[ -f $MANIFEST ]] || return 0
+  while IFS= read -r f; do
+    [[ $f == "$PREFIX"/* ]] && rm -f -- "$f"
+  done <"$MANIFEST"
+  rmdir --ignore-fail-on-non-empty "$PREFIX/include/libfprint-2" 2>/dev/null || true
+}
+
+restart_fprintd() { systemctl restart fprintd.service 2>/dev/null || true; sleep 1; }
+
+cmd_install() {
+  require_root install "$@"
+  local force=0 hw name stage resolved
+  while (( $# )); do
+    case $1 in
+      --force) force=1 ;;
+      --version) [[ -n ${2:-} ]] || die "--version needs a libfprint tag, e.g. v1.94.10 or a commit hash"; LIBFPRINT_TAG=$2; shift ;;
+      *) die "unknown option for install: $1" ;;
+    esac
+    shift
+  done
+  command -v apt-get >/dev/null || die "only Debian/Ubuntu-based systems are supported so far"
+
+  hw=$(sensors)
+  if [[ -z $hw ]]; then
+    (( force )) || die "No fingerprint sensor from a known maker was found on USB. Use --force to build anyway."
+    warn "no known fingerprint sensor found; building anyway (--force)"
+  else
+    ok "Found sensor: $(cut -f2 <<<"$hw" | paste -sd ',') ($(cut -f1 <<<"$hw" | paste -sd ','))"
+  fi
+
+  name=$(reader_name "$(fprintd_info "$(target_user)")")
+  if [[ -n $name && -z $(installed_tag) && $(loaded_lib) != "$PREFIX"/* ]] && (( ! force )); then
+    ok "Your reader already works with the system driver ($name). Nothing to install."
+    return 0
+  fi
+
+  install_packages "${BUILD_DEPS[@]}" "${RUNTIME_DEPS[@]}"
+  build_libfprint
+
+  if [[ -n $hw ]] && ! build_supports_sensor; then
+    (( force )) || die "libfprint $(ref_label "$LIBFPRINT_TAG") does not support your sensor ($(cut -f1 <<<"$hw" | paste -sd ',')) either. See https://fprint.freedesktop.org/supported-devices.html"
+    warn "libfprint $(ref_label "$LIBFPRINT_TAG") does not list your sensor; installing anyway (--force)"
+  else
+    ok "libfprint $(ref_label "$LIBFPRINT_TAG") supports your sensor"
+  fi
+
+  step "Installing into $PREFIX"
+  stage=$WORK_DIR/stage
+  rm -rf "$stage"
+  run_logged meson install -C "$WORK_DIR/libfprint-$LIBFPRINT_TAG/_build" --no-rebuild --destdir "$stage"
+  remove_installed_files
+  mkdir -p "$STATE_DIR"
+  (cd "$stage" && find . ! -type d | sed 's|^\.||' | sort) >"$MANIFEST"
+  cp -a "$stage/." /
+  rm -rf "$stage"
+  echo "$LIBFPRINT_TAG" >"$STATE_DIR/version"
+  echo "$PREFIX/lib" >"$LDCONF"
+  ldconfig
+
+  resolved=$(loaded_lib)
+  [[ $resolved == "$PREFIX"/* ]] || warn "the system still loads $resolved instead of the new library"
+
+  step "Restarting the fingerprint service"
+  restart_fprintd
+  name=$(reader_name "$(fprintd_info "$(target_user)")")
+  if [[ -n $name ]]; then
+    ok "Reader ready: $name"
+    echo "Next: register a finger with 'fingerprint-setup enroll'."
+  else
+    warn "fprintd does not see the reader yet. Reboot and run 'fingerprint-setup status'."
+  fi
+}
+
+cmd_uninstall() {
+  require_root uninstall "$@"
+  local all=0
+  [[ ${1:-} == --all ]] && all=1
+  if [[ -f $MANIFEST ]]; then
+    step "Removing libfprint $(ref_label "$(installed_tag)") from $PREFIX"
+    remove_installed_files
+    rm -f "$LDCONF"
+    rm -rf "$STATE_DIR" "$WORK_DIR"
+    ldconfig
+    restart_fprintd
+    ok "Removed. The distribution's libfprint is used again."
+    login_enabled && echo "Fingerprint login is still on; turn it off with 'fingerprint-setup login off' if the reader no longer works."
+  else
+    ok "No driver installed by fingerprint-setup."
+  fi
+  if (( all )); then
+    rm -f "$PREFIX/bin/fingerprint-setup" "$PREFIX/share/applications/fingerprint-setup.desktop"
+    ok "Removed the fingerprint-setup app."
+  fi
+}
+
+# ---------------------------------------------------------------- fingers & login
+
+cmd_enroll() {
+  require_user
+  local finger=${1:-right-index-finger}
+  valid_finger "$finger" || die "unknown finger '$finger'. Choose one of: ${FINGERS[*]}"
+  need_reader
+  echo "Registering your $finger."
+  echo "Touch the sensor, lift, touch again. Use a slightly different part of the finger each"
+  echo "time (flat pad, tip, left and right edge) until it says enroll-completed."
+  fprintd-enroll -f "$finger"
+}
+
+cmd_verify() {
+  require_user
+  need_reader
+  echo "Touch the sensor with a registered finger."
+  fprintd-verify
+}
+
+cmd_delete() {
+  require_user
+  fprintd-delete "$(id -un)"
+}
+
+cmd_login() {
+  local mode=${1:-}
+  [[ $mode == on || $mode == off ]] || die "usage: fingerprint-setup login on|off"
+  require_root login "$@"
+  command -v pam-auth-update >/dev/null || die "pam-auth-update not found (only Debian/Ubuntu are supported)"
+  if [[ $mode == on ]]; then
+    install_packages libpam-fprintd
+    # Allow three tries before falling back to the password (the default is one).
+    sed -i -E 's/max-tries=[0-9]+/max-tries=3/' "$PAM_PROFILE"
+    DEBIAN_FRONTEND=noninteractive pam-auth-update --enable fprintd
+    DEBIAN_FRONTEND=noninteractive pam-auth-update --package
+    ok "Fingerprint login is on (login screen, lock screen, sudo). Your password still works too."
+    [[ -n $(enrolled_fingers "$(fprintd_info "$(target_user)")") ]] ||
+      warn "no finger registered yet; run 'fingerprint-setup enroll'"
+  else
+    DEBIAN_FRONTEND=noninteractive pam-auth-update --disable fprintd
+    ok "Fingerprint login is off."
+  fi
+}
+
+cmd_status() {
+  status_lines | sed -E "s/^([^:]+):/$B\\1:$N/"
+}
+
+cmd_setup() {
+  require_user
+  local answer
+  sudo -- "$SELF" install
+  need_reader
+  echo
+  read -rp "Register your right index finger now? [Y/n] " answer </dev/tty || answer=n
+  [[ $answer =~ ^[Nn] ]] || cmd_enroll right-index-finger || warn "registering failed; try again with 'fingerprint-setup enroll'"
+  echo
+  read -rp "Use your fingerprint for login, the lock screen and sudo? [Y/n] " answer </dev/tty || answer=n
+  [[ $answer =~ ^[Nn] ]] || sudo -- "$SELF" login on
+  echo
+  ok "All set. Open 'Fingerprint Setup' from your app menu (or run 'fingerprint-setup gui') to manage it later."
+}
+
+# ---------------------------------------------------------------- window (zenity)
+
+gui_info()  { zenity --info --title="Fingerprint Setup" --width=420 --text="$1" || true; }
+gui_error() { zenity --error --title="Fingerprint Setup" --width=420 --text="$1" || true; }
+
+# Run this script as root via pkexec, showing its "==>" steps in a progress window.
+gui_root() {
+  local title=$1 log rc
+  shift
+  log=$(mktemp)
+  ( pkexec "$SELF" "$@" 2>&1; echo "__rc=$?" ) | tee "$log" |
+    awk '/^==> /{sub(/^==> /, "#"); print; fflush()} END{print 100}' |
+    zenity --progress --pulsate --auto-close --no-cancel --title="$title" --text="Starting…" --width=460 || true
+  rc=$(sed -n 's/^__rc=//p' "$log" | tail -n 1)
+  if [[ $rc == 0 ]]; then
+    gui_info "$(grep -E '^(✓|warning:|Next:|Fingerprint login is still)' "$log" | markup_escape)"
+  elif [[ $rc == 126 || $rc == 127 ]]; then
+    : # password dialog cancelled
+  else
+    gui_error "$title failed:
+
+$(grep -v '^__rc=' "$log" | tail -n 12 | markup_escape)"
+  fi
+  rm -f "$log"
+}
+
+# Run an fprintd tool, turn its result lines into friendly progress text.
+gui_fprint() {
+  local title=$1 text=$2 log
+  shift 2
+  log=$(mktemp)
+  if ! ( LC_ALL=C "$@" 2>&1; echo "__rc=$?" ) | tee "$log" | awk '
+      /enroll-stage-passed/ { n++; printf "#Good, %d so far. Lift your finger and touch again with a slightly different part of it.\n", n; fflush(); next }
+      /enroll-(retry-scan|swipe-too-short|finger-not-centered|remove-and-retry)/ { print "#That one did not register. Lift your finger and touch again."; fflush(); next }
+      /verify-no-match/ { print "#No match."; fflush(); next }
+      END { print 100 }' |
+      zenity --progress --pulsate --auto-close --title="$title" --text="$text" --width=480; then
+    pkill -u "$(id -u)" -x "$(basename "$1")" 2>/dev/null || true   # cancelled
+    rm -f "$log"
+    return 1
+  fi
+  cat "$log"
+  rm -f "$log"
+}
+
+gui_enroll() {
+  local finger out
+  finger=$(zenity --list --title="Register a finger" --text="Which finger do you want to register?" \
+    --column=Finger --hide-header --width=360 --height=440 "${FINGERS[@]}") || return 0
+  [[ -n $finger ]] || return 0
+  out=$(gui_fprint "Register $finger" "Touch the fingerprint sensor with your $finger…" fprintd-enroll -f "$finger") || return 0
+  if grep -q enroll-completed <<<"$out"; then
+    gui_info "Your $finger is registered."
+  elif grep -q enroll-duplicate <<<"$out"; then
+    gui_error "This finger is already registered (maybe under another name)."
+  else
+    gui_error "Registering did not finish:
+
+$(grep -v '^__rc=' <<<"$out" | tail -n 6 | markup_escape)"
+  fi
+}
+
+gui_verify() {
+  local out
+  out=$(gui_fprint "Test fingerprint" "Touch the sensor with a registered finger…" fprintd-verify) || return 0
+  if grep -q verify-match <<<"$out"; then
+    gui_info "✓ Match. Your fingerprint was recognised."
+  elif grep -q verify-no-match <<<"$out"; then
+    gui_error "No match. Try again, or register the finger again for better coverage."
+  else
+    gui_error "$(grep -v '^__rc=' <<<"$out" | tail -n 6 | markup_escape)"
+  fi
+}
+
+cmd_gui() {
+  require_user
+  command -v zenity >/dev/null || die "the window needs zenity: sudo apt install zenity"
+  [[ -n ${DISPLAY:-}${WAYLAND_DISPLAY:-} ]] || die "no desktop session found; see 'fingerprint-setup help' for the terminal commands"
+  GUI=1
+  local choice summary has_reader
+  while :; do
+    summary=$(status_lines | markup_escape | sed -E 's/^([^:]+):/<b>\1:<\/b>/')
+    has_reader=$(reader_name "$(fprintd_info "$(id -un)")")
+    choice=$(zenity --list --title="Fingerprint Setup" --width=560 --height=520 \
+      --text="$summary" --column=id --column="What do you want to do?" \
+      --hide-column=1 --print-column=1 \
+      install   "Install or update the fingerprint driver" \
+      enroll    "Register a finger" \
+      verify    "Test a registered finger" \
+      login-on  "Turn on fingerprint login (login screen, lock screen, sudo)" \
+      login-off "Turn off fingerprint login" \
+      delete    "Remove all my registered fingers" \
+      uninstall "Uninstall the driver") || return 0
+    case $choice in
+      install)   gui_root "Installing the fingerprint driver" install ;;
+      enroll)    if [[ -n $has_reader ]]; then gui_enroll; else gui_error "No working reader yet. Install the driver first."; fi ;;
+      verify)    if [[ -n $has_reader ]]; then gui_verify; else gui_error "No working reader yet. Install the driver first."; fi ;;
+      login-on)  gui_root "Turning on fingerprint login" login on ;;
+      login-off) gui_root "Turning off fingerprint login" login off ;;
+      delete)    if zenity --question --title="Remove fingers" --text="Remove all your registered fingerprints?"; then
+                   if fprintd-delete "$(id -un)" >/dev/null 2>&1; then gui_info "All your fingerprints were removed."
+                   else gui_error "Could not remove them."; fi
+                 fi ;;
+      uninstall) zenity --question --title="Uninstall" --text="Remove the driver installed by Fingerprint Setup?\nThe reader will stop working until you install it again." &&
+                   gui_root "Uninstalling the fingerprint driver" uninstall ;;
+    esac
+  done
+}
+
+# ---------------------------------------------------------------- main
+
+usage() {
+  cat <<EOF
+${B}fingerprint-setup $VERSION${N}: get your fingerprint reader working on Ubuntu/Debian
+$PROJECT_URL
+
+Usage: fingerprint-setup [COMMAND]
+
+  setup              guided setup: install the driver, register a finger, turn on login
+  gui                open the window (also in your app menu as "Fingerprint Setup")
+  status             show sensor, driver, registered fingers and login state
+  install            build and install the newest libfprint (asks for your password)
+      --version TAG    libfprint tag or commit to build (default ${DEFAULT_TAG:0:10})
+      --force          build even if no sensor is found or the reader already works
+  enroll [FINGER]    register a finger (default right-index-finger)
+  verify             test a registered finger
+  delete             remove all your registered fingers
+  login on|off       use the fingerprint for login, lock screen and sudo
+  uninstall [--all]  remove the driver (--all: also remove this app)
+  help, version
+
+Without a command it opens the window on a desktop, otherwise shows the status.
+EOF
+}
+
+main() {
+  local cmd=${1:-}
+  (( $# )) && shift
+  case $cmd in
+    "")              if [[ -n ${DISPLAY:-}${WAYLAND_DISPLAY:-} ]] && command -v zenity >/dev/null && (( EUID != 0 )); then cmd_gui; else cmd_status; echo; usage; fi ;;
+    setup)           cmd_setup "$@" ;;
+    gui)             cmd_gui "$@" ;;
+    status)          cmd_status ;;
+    install)         cmd_install "$@" ;;
+    enroll)          cmd_enroll "$@" ;;
+    verify)          cmd_verify ;;
+    delete)          cmd_delete ;;
+    login)           cmd_login "$@" ;;
+    uninstall)       cmd_uninstall "$@" ;;
+    version|--version|-V) echo "fingerprint-setup $VERSION (libfprint ${DEFAULT_TAG:0:10})" ;;
+    help|--help|-h)  usage ;;
+    *)               usage >&2; exit 2 ;;
+  esac
+}
+
+if [[ ${BASH_SOURCE[0]} == "$0" ]]; then
+  main "$@"
+fi
